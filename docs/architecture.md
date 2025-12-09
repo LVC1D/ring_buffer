@@ -60,6 +60,14 @@ To begin with, the structure will be synchronous - no async mechanism will be im
 
 When we get to the async part, we will wake the channels directly within the send / recv call because our program is not IO-bound but rather CPU-bound.
 
+### Implementation Notes
+
+In regards to the buffer structure, we have opted in for a MaybeUninit instead of an Option type because Options use up to 8 bytes per value due to the discriminant and the padding (in case it’s a Some) - so our buffer weighs less bytes.
+
+Although the atomics exists to safely perform head and tail arithmetics asynchronously, we still needed to add in a Mutex lock field - because our push() and pop() require an IMmutable borrow of self - and that’s important to avoid any aliasing violation AND be able to concurrently perform multiple pushes and pops safely.
+
+Upon the Drop implementation, the MaybeUninit union offers an `.assume_init_drop()` method that drops any value that is initialized. What I completely oversaw was that it does not skip over any uninitialized fields - the attempt to drop those slots would cause a Double-Free UB.
+
 ### Type-State Enforcement
 
 States will be encoded in the type system using `PhantomData<S>`:
