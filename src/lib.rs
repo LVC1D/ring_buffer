@@ -1,1 +1,2 @@
-pub mod ring_buffer.rs
+pub mod channel;
+pub mod ring_buffer;
