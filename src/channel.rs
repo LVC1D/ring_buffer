@@ -11,12 +11,14 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum SendError {
     BufferFull,
+    Closed,
 }
 
 impl Display for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BufferFull => write!(f, "Buffer is full"),
+            Self::Closed => write!(f, "Channel closed"),
         }
     }
 }
@@ -122,6 +124,13 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
+
+        let senders_alive = Arc::strong_count(&this.sender.inner.sender_count) >= 1;
+
+        if !senders_alive {
+            return Poll::Ready(Err(SendError::Closed));
+        }
+
         if let Some(res) = this.value.take() {
             match this.sender.inner.buffer.push(res) {
                 Ok(()) => {
@@ -199,6 +208,10 @@ impl<'a, T> Future for RecvFuture<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
+    use test_strategy::proptest as async_proptest;
+    use tokio::task::JoinSet;
 
     #[tokio::test]
     async fn test_single_send_recv() {
@@ -238,5 +251,142 @@ mod tests {
         assert_eq!(rx.recv().await, Some(1)); // Should drain
         assert_eq!(rx.recv().await, Some(2)); // Should drain
         assert_eq!(rx.recv().await, None); // Should close
+    }
+
+    #[tokio::test]
+    async fn test_mpmc_stress() {
+        let (tx, rx) = channel::<u32>(64);
+        let sent = Arc::new(Mutex::new(HashSet::<u32>::new()));
+        let received = Arc::new(Mutex::new(HashSet::<u32>::new()));
+
+        let mut all_handlers = vec![];
+
+        // 4 senders, each sends 0-2499 with offset
+        // 4 receivers, collect all messages
+
+        for i in 0..4 {
+            let tx = tx.clone();
+            let sent = sent.clone();
+            let handler = tokio::spawn(async move {
+                for j in 1..=2500 {
+                    let res = (j + 2500 * i) as u32;
+                    tx.send(res).await.unwrap();
+                    sent.lock().unwrap().insert(res);
+                }
+            });
+            all_handlers.push(handler);
+        }
+
+        drop(tx);
+
+        for _ in 1..=4 {
+            let rx = rx.clone();
+            let received = received.clone();
+            let handler = tokio::spawn(async move {
+                while let Some(got) = rx.recv().await {
+                    received.lock().unwrap().insert(got);
+                }
+            });
+            all_handlers.push(handler);
+        }
+
+        for handle in all_handlers {
+            let _ = handle.await;
+        }
+
+        for val in sent.lock().unwrap().iter() {
+            assert_eq!(val, received.lock().unwrap().get(val).unwrap())
+        }
+        assert_eq!(sent.lock().unwrap().len(), 10000);
+    }
+
+    #[tokio::test]
+    async fn test_simple_channel_creation() {
+        println!("Before channel creation");
+        let (tx, rx) = channel::<u8>(2);
+        println!("After channel creation");
+        drop(tx);
+        drop(rx);
+        println!("Test complete");
+    }
+
+    #[tokio::test]
+    async fn test_backpressure() {
+        let (tx, rx) = channel::<u8>(4);
+        tx.send(5).await.unwrap();
+        tx.send(3).await.unwrap();
+        tx.send(8).await.unwrap();
+
+        println!("Buffer filled");
+
+        let tx_clone = tx.clone();
+        let third_try = tokio::spawn(async move {
+            println!("Third send starting");
+            let result = tx_clone.send(3).await;
+            println!("Third send completed");
+            result
+        });
+
+        tokio::task::yield_now().await;
+        println!("After yield");
+
+        assert!(!third_try.is_finished());
+        println!("Assertion passed, dropping tx");
+        drop(tx);
+
+        println!("About to recv");
+        assert_eq!(rx.recv().await, Some(5));
+        println!("Recv completed");
+
+        println!("About to await third_try");
+        third_try.await.unwrap().unwrap();
+        println!("Test complete");
+    }
+
+    #[ignore]
+    #[async_proptest(async = "tokio")]
+    async fn channel_preserves_all_messages(
+        #[strategy(prop::sample::select(vec![4usize, 8, 16, 32, 64]))] capacity: usize,
+        #[strategy(1usize..=1000)] num_messages: usize,
+    ) {
+        // Send num_messages through channel with capacity
+        // Receive all of them
+        // Assert: all messages arrived, none lost, none duplicated
+
+        let sent = Arc::new(Mutex::new(HashSet::<String>::new()));
+        let received = Arc::new(Mutex::new(HashSet::<String>::new()));
+
+        let (tx, rx) = channel::<String>(capacity);
+        let mut set = JoinSet::new();
+
+        let recv_clone = received.clone();
+
+        let sent_clone = sent.clone();
+        let tx_clone = tx.clone();
+        set.spawn(async move {
+            for j in 1..=num_messages {
+                let msg = format!("Test {j}");
+                tx_clone.send(msg.clone()).await.unwrap();
+                sent_clone.lock().unwrap().insert(msg);
+            }
+        });
+
+        drop(tx);
+
+        set.spawn(async move {
+            while let Some(got) = rx.recv().await {
+                recv_clone.lock().unwrap().insert(got);
+            }
+        });
+
+        while let Some(result) = set.join_next().await {
+            result.unwrap();
+        }
+
+        for val in sent.lock().unwrap().iter() {
+            let guard = received.lock().unwrap();
+            prop_assert_eq!(val, guard.get(val).unwrap());
+        }
+        prop_assert_eq!(sent.lock().unwrap().len(), num_messages);
     }
 }

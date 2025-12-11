@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 thiserror = "2.0.17"
 tokio = {workspace = true}
+
+[dev-dependencies]
+proptest = { workspace = true }
+test-strategy = "0.4.3"
