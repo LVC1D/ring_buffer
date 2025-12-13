@@ -6,7 +6,12 @@ edition = "2024"
 [dependencies]
 thiserror = "2.0.17"
 tokio = {workspace = true}
+criterion = {workspace = true}
 
 [dev-dependencies]
 proptest = { workspace = true }
 test-strategy = "0.4.3"
+
+[[bench]]
+name = "channel_bench"
+harness = false

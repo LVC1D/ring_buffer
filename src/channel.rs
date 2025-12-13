@@ -163,6 +163,25 @@ where
     }
 }
 
+impl<T, S> Drop for Sender<T, S> {
+    fn drop(&mut self) {
+        let count = Arc::strong_count(&self._sender_ref);
+
+        if count == 2 {
+            let wakers: Vec<_> = self
+                .inner
+                .waiting_receivers
+                .lock()
+                .unwrap()
+                .drain(..)
+                .collect();
+
+            for waker in wakers {
+                waker.wake();
+            }
+        }
+    }
+}
 pub struct RecvFuture<'a, T> {
     receiver: &'a Receiver<T, Open>,
 }
@@ -175,9 +194,8 @@ impl<'a, T> Future for RecvFuture<'a, T> {
         let buffer_empty = self.receiver.inner.buffer.is_empty();
 
         if !senders_alive && buffer_empty {
-            return Poll::Ready(None); // Channel closing
+            return Poll::Ready(None);
         }
-
         match self.receiver.inner.buffer.pop() {
             Some(val) => {
                 if let Some(waker) = self
@@ -199,6 +217,21 @@ impl<'a, T> Future for RecvFuture<'a, T> {
                     .lock()
                     .unwrap()
                     .push_back(cx.waker().clone());
+
+                // Check again after adding to queue!
+                let senders_still_alive = Arc::strong_count(&self.receiver.inner.sender_count) > 1;
+                if !senders_still_alive && self.receiver.inner.buffer.is_empty() {
+                    // Senders died while we were adding to queue
+                    // Remove ourselves and return None
+                    self.receiver
+                        .inner
+                        .waiting_receivers
+                        .lock()
+                        .unwrap()
+                        .pop_back(); // Remove the waker we just added
+                    return Poll::Ready(None);
+                }
+
                 Poll::Pending
             }
         }
@@ -388,5 +421,38 @@ mod tests {
             prop_assert_eq!(val, guard.get(val).unwrap());
         }
         prop_assert_eq!(sent.lock().unwrap().len(), num_messages);
+    }
+
+    #[tokio::test]
+    async fn test_drop_wakes_receivers() {
+        let (tx, rx) = channel::<u32>(4);
+
+        // Spawn 2 receivers that will wait
+        let rx1 = rx.clone();
+        let h1 = tokio::spawn(async move {
+            println!("Receiver 1 starting");
+            let result = rx1.recv().await;
+            println!("Receiver 1 got: {:?}", result);
+            result
+        });
+
+        let rx2 = rx.clone();
+        let h2 = tokio::spawn(async move {
+            println!("Receiver 2 starting");
+            let result = rx2.recv().await;
+            println!("Receiver 2 got: {:?}", result);
+            result
+        });
+
+        // Let receivers start waiting
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        println!("Dropping all senders");
+        drop(tx);
+
+        // Both should complete with None
+        assert_eq!(h1.await.unwrap(), None);
+        assert_eq!(h2.await.unwrap(), None);
+        println!("Test passed!");
     }
 }
